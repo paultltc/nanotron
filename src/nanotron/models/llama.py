@@ -883,13 +883,15 @@ class LlamaModel(nn.Module):
         self,
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
+        input_domain: Optional[Union[torch.Tensor, TensorPointer]] = None,  # [batch_size, 1]
     ):
-        return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask)[0]
+        return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask, input_domain=input_domain)[0]
 
     def forward_with_hidden_states(
         self,
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
+        input_domain: Optional[Union[torch.Tensor, TensorPointer]] = None,  # [batch_size, 1]
     ):
         # all tensors are optional as most ranks don't need anything from the dataloader.
 
@@ -951,7 +953,7 @@ class LlamaModel(nn.Module):
 @torch.jit.script
 def masked_mean(loss, label_mask, dtype):
     # type: (Tensor, Tensor, torch.dtype) -> Tensor
-    return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
+    return (loss * label_mask).sum(dim=1, dtype=dtype) / label_mask.sum(dim=1)
 
 
 class Loss(nn.Module):
@@ -968,14 +970,14 @@ class Loss(nn.Module):
         # Megatron by defaults cast everything in fp32. `--f16-lm-cross-entropy` is an option you can use to keep current precision.
         # https://github.com/NVIDIA/Megatron-LM/blob/f267e6186eae1d6e2055b412b00e2e545a8e896a/megatron/model/gpt_model.py#L38
 
-        loss = sharded_cross_entropy(
+        sample_loss = sharded_cross_entropy(
             sharded_logits, label_ids.transpose(0, 1).contiguous(), group=self.tp_pg, dtype=torch.float
         ).transpose(0, 1)
         # TODO @thomasw21: It's unclear what kind of normalization we want to do.
-        loss = masked_mean(loss, label_mask, dtype=torch.float)
+        sample_loss = masked_mean(sample_loss, label_mask, dtype=torch.float)
         # I think indexing causes a sync we don't actually want
         # loss = loss[label_mask].sum()
-        return {"loss": loss}
+        return {"sample_loss": sample_loss}
 
 
 class LlamaForTraining(NanotronModel):
@@ -997,7 +999,7 @@ class LlamaForTraining(NanotronModel):
                 "label_ids",
                 "label_mask",
             },
-            module_output_keys={"loss"},
+            module_output_keys={"sample_loss"},
         )
         self.parallel_context = parallel_context
         self.config = config
@@ -1009,17 +1011,22 @@ class LlamaForTraining(NanotronModel):
         input_mask: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        input_domain: Optional[Union[torch.Tensor, TensorPointer]] = None,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
+            input_domain=input_domain,
         )
-        loss = self.loss(
+        sample_loss = self.loss(
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
-        )["loss"]
-        return {"loss": loss}
+        )["sample_loss"]
+        return {
+            "sample_loss": sample_loss,
+            "loss": torch.mean(sample_loss),
+        }
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):

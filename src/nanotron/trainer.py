@@ -81,6 +81,7 @@ from nanotron.s3_checkpoints import S3Mover, check_path_is_local
 from nanotron.sanity_checks import (
     after_optim_step_sanity_checks,
     after_tbi_sanity_checks,
+    assert_tensor_synced_across_pg,
     before_optim_step_sanity_checks,
     before_tbi_sanity_checks,
 )
@@ -256,6 +257,8 @@ class DistributedTrainer:
         self.limit_val_batches = self.config.tokens.limit_val_batches
         # NOTE: the dataloader currently in use for the current training stage
         self.current_dataloader: Optional[DataLoader] = None
+        # NOTE: the dataloader currently in use for the current validation stage
+        self.current_validation_dataloader: Optional[DataLoader] = None
 
         self.post_init()
 
@@ -319,6 +322,106 @@ class DistributedTrainer:
                 f"[Training Plan] There are {len(self.config.data_stages)} training stages \n{stages_info}"
             )
             log_rank(full_log_message, logger=logger, level=logging.INFO, rank=0)
+
+    def _prepare_dataloader_for_validation_stage(self, dataloaders: Union[List[DataLoader], DataLoader]):
+        # NOTE(tj.solergibert) Similar to _update_dataloader_based_on_training_stages BUT:
+        #   1. We call this function EVERY TIME we run the validation loop
+        #   2. Every time it returns a NEW validation iterator DataLoader. If you don't do this you'll consume the whole validation dataset
+        #       in the first iteration and subsequent validations will fail
+        # `dataloaders` are either torch DataLoaders (the very first stage) OR functions that we call later that provide torch DataLoaders (subsequent stages)
+        # From this torch DataLoaders objects we then call `sanity_check_dataloader` that will return a iterator.
+        # In short, `sanity_check_dataloader` just places the input tensors in the GPU when necessary (TensorPointers stay in the CPU)
+        #
+        # TBH, the for loop below it's just for deleting the DataLoaders of previous stages, which is not so problematic. The important part is returning the
+        # DataLoader iterator every time we call this function from the current training stage, which is tracked during training
+        #
+        # Also, keep in mind that if val_check_interval = 5 & data.start_training_step = 10 we will already perform the evaluation with the SECOND data stage
+        # after just training for the current iteration, so it might not be a good idea to set evals during the stage in which we change of data stage
+        #
+        # NOTE(tj.solergibert) Further investigation should be done, but there is a extrange behaiviour when deleting the DataLoaders////lambda functs. As they
+        # are converted into Iterators with `sanity_check_dataloader` we can't access anymore the DataLoader object to del the dataset (After first stage,
+        # in this function we locally create the DataLoder from the lambda func --> Return Iterator)
+        #
+        # Also when the gc deletes the first stage dataloader, all the `DatatroveFileDataset._f` are already None AND the `del` thing are deleting a copy of the
+        # object, not the object itself
+        #
+        # FINAL NOTE(tj.solergibert) I will open a Issue in nanotron to check with them if they are aware of this useless deletitions
+        #
+        # TODO(tj.solergibert) Check the tuple case below
+        from collections.abc import Generator
+
+        if not hasattr(self.config, "data_stages") or self.config.data_stages is None:
+
+            if isinstance(dataloaders, tuple):  # TODO(tj.solergibert) Check this tuple case
+                dataloader = dataloaders[0]
+            else:
+                dataloader = dataloaders
+
+            self.current_validation_dataloader_lenght = len(dataloader)
+            self.current_validation_dataloader = sanity_check_dataloader(
+                dataloader=dataloader, parallel_context=self.parallel_context, config=self.config
+            )
+
+            return
+        elif isinstance(dataloaders, Generator):
+            # TODO(xrsrke): this is a hacky way to handle DoReMi's dataloader
+            # remove this in the next PR
+            self.current_validation_dataloader = dataloaders
+            return
+
+        assert len(dataloaders) > 0, "No dataloaders provided"
+        assert len(dataloaders) == len(
+            self.config.data_stages
+        ), "Number of dataloaders should match the number of dataset stages"
+
+        def clear_dataloader_from_memory(dataloader: DataLoader, stage_name: str, prev_stage_name: str):
+            import gc
+
+            log_rank(
+                f"[Validation Stage: {stage_name}] Clearing the previous validation stage's ({prev_stage_name}) dataloader and dataset from memory",
+                logger=logger,
+                level=logging.INFO,
+            )
+
+            # NOTE: Clear dataloader from memory
+            del dataloader.dataset
+            del dataloader.sampler
+            del dataloader.batch_sampler
+
+            gc.collect()
+
+        for stage_idx, stage in enumerate(self.config.data_stages):
+            if stage_idx < self.metadata.last_stage_idx:
+                continue
+            # NOTE(tj.solergibert) From this point stage_idx = self.metadata.last_stage_idx. We update self.metadata.last_stage_idx (which keeps track of the training stage)
+            #   in each and every training step.
+
+            if (
+                stage_idx is not self.metadata.last_stage_idx
+            ): 
+                self.metadata.last_stage_idx = stage_idx  # Update validation stage index
+                # Delete previous stage DataLoader
+                prev_stage_name = self.config.data_stages[stage_idx - 1].name
+                prev_dataloader = dataloaders[prev_stage_name]
+
+                if isinstance(prev_dataloader, DataLoader):
+                    # NOTE: we don't need to clear dummy data generator from memory
+                    clear_dataloader_from_memory(
+                        prev_dataloader, stage_name=stage.name, prev_stage_name=prev_stage_name
+                    )
+
+                self.metadata.last_stage_idx = stage_idx  # Update validation stage index
+
+            # NOTE(tj.solergibert) Create AGAIN the DataLoader
+            dataloader = dataloaders[stage.name]
+            # NOTE: if a dataloader is lazy initialized, we need to call it to initialize it
+            dataloader = dataloader() if callable(dataloader) else dataloader
+            break
+
+        self.current_validation_dataloader_lenght = len(dataloader)
+        self.current_validation_dataloader = sanity_check_dataloader(
+            dataloader=dataloader, parallel_context=self.parallel_context, config=self.config
+        )  # NOTE(tj.solergibert) Create a Iterator from the DataLoader
 
     def _update_dataloader_based_on_training_stages(self, dataloaders: Union[List[DataLoader], DataLoader]):
         from collections.abc import Generator
@@ -413,7 +516,10 @@ class DistributedTrainer:
 
     def train(
         self,
-        dataloader_or_dls: Dict[
+        train_dataloader_or_dls: Dict[
+            str, Union[Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]], Tuple[Iterator, ...]]
+        ],
+        valid_dataloader_or_dls: Dict[
             str, Union[Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]], Tuple[Iterator, ...]]
         ],
         **kwargs,
@@ -449,10 +555,23 @@ class DistributedTrainer:
                     prof.step()
 
                 self.iteration_start_time = time.time()
-                self._update_dataloader_based_on_training_stages(dataloader_or_dls)
+                self._update_dataloader_based_on_training_stages(train_dataloader_or_dls)
 
                 # Training step
                 outputs, loss_avg = self.training_step(dataloader=self.current_dataloader)
+                self.training_step_time = time.time()
+
+                # Validation stage
+                if self.iteration_step % self.config.tokens.val_check_interval == 0:
+                    self._prepare_dataloader_for_validation_stage(valid_dataloader_or_dls)
+                    val_global_loss, val_domain_losses = self.validation_step(
+                        dataloader=self.current_validation_dataloader
+                    )
+                    self.validation_step_time = time.time()
+                else:
+                    # NOTE(tj.solergibert) As we are reporting the training & validation metrics together, we
+                    # must comply with val_check_interval % iteration_step_info_interval = 0
+                    val_global_loss, val_domain_losses = None, None
 
                 # Training Logs
                 # TODO(xrsrke): refactor using callbacks would be better
@@ -464,6 +583,8 @@ class DistributedTrainer:
 
                 if (self.iteration_step - 1) % self.config.logging.iteration_step_info_interval == 0:
                     self.train_step_logs(outputs=outputs, loss_avg=loss_avg)
+                    if self.iteration_step % self.config.tokens.val_check_interval == 0:
+                        self.val_step_logs(global_loss=val_global_loss, domain_losses=val_domain_losses)
 
                 # Checkpoint
                 if self.iteration_step % self.config.checkpoints.checkpoint_interval == 0:
@@ -586,7 +707,64 @@ class DistributedTrainer:
             batch=(next(dataloader) for _ in range(self.limit_val_batches)),
             nb_microbatches=self.limit_val_batches,
         )
-        return outputs
+
+        domains_list = self.config.data_stages[self.metadata.last_stage_idx].data.dataset.domains
+        domain_losses = {domain: [] for domain in domains_list}
+
+        # Compute losses
+        if isinstance(outputs[0]["sample_loss"], torch.Tensor):
+            # Multilingual losses
+            for batch_output in outputs:
+                for domain, sample_loss in zip(batch_output["domain_idx"], list(batch_output["sample_loss"])):
+                    if domains_list:
+                        domain = domains_list[domain]
+                    domain_losses[domain].append(sample_loss)
+            # Global loss
+            global_loss_avg = torch.mean(torch.stack([output["sample_loss"] for output in outputs]))
+
+            # Sync multilingual losses across DP
+            for domain in domain_losses.keys():
+                if not domain_losses[domain]:  # If the list is empty --> Set local language loss to -1 to exclude it from the global computation
+                    domain_losses[domain] = torch.tensor(-1, dtype=torch.float32, device="cuda")
+                else:  # If we have at least 1 loss from a given language --> compute local language loss mean
+                    domain_losses[domain] = torch.mean(torch.stack(domain_losses[domain]))
+
+            per_domain_loss = torch.stack(list(domain_losses.values())).unsqueeze(0)  # (1, LANGS)
+            dist.all_reduce(per_domain_loss, group=self.parallel_context.dp_pg, op=dist.ReduceOp.AVG)
+
+            mask = per_domain_loss != -1
+            domain_losses_tensor_local = (per_domain_loss * mask).sum(dim=0) / mask.sum(dim=0)  # (1, LANGS)
+            for idx, domain in enumerate(domain_losses.keys()):
+                domain_losses[domain] = domain_losses_tensor_local[idx]
+
+            # Sync global losses across DP
+            dist.all_reduce(global_loss_avg, group=self.parallel_context.dp_pg, op=dist.ReduceOp.AVG)
+
+            # TODO(tj.solergibert) Delete this testing assertions
+            for domain in domain_losses.keys():
+                assert_tensor_synced_across_pg(tensor=domain_losses[domain], pg=self.parallel_context.dp_pg)
+            assert_tensor_synced_across_pg(tensor=global_loss_avg, pg=self.parallel_context.dp_pg)
+
+        else:
+            global_loss_avg = None
+            domain_losses = None
+
+        return global_loss_avg, domain_losses
+
+    def memory_logs(self) -> List[LogItem]:
+        total, used, free = shutil.disk_usage("/")
+        memory_entries = [
+                LogItem(
+                    "memory/cuda_memory_allocated", torch.cuda.memory_allocated(), "human_format"
+                ),  #  / 1024**2, ".2f"),
+                LogItem(
+                    "memory/cuda_max_memory_reserved", torch.cuda.max_memory_reserved(), "human_format"
+                ),  #  / 1024**2, ".2f"),
+                LogItem("memory/hd_total_memory_tb", total, "human_format"),  #  / (2**40), ".2f"),
+                LogItem("memory/hd_used_memory_tb", used, "human_format"),  #  / (2**40), ".2f"),
+                LogItem("memory/hd_free_memory_tb", free, "human_format"),  #  / (2**40), ".2f"),
+            ]
+        return memory_entries
 
     def train_step_logs(
         self,
@@ -614,41 +792,28 @@ class DistributedTrainer:
             log_entries = [
                 # LogItem("consumed_samples", self.consumed_train_samples, "human_format"),  # , "12d"),
                 LogItem(
-                    "consumed_tokens",
+                    "train/consumed_tokens",
                     self.metadata.consumed_train_samples * self.config.tokens.sequence_length,
                     "human_format",
                 ),  # , "12d"),
-                LogItem("elapsed_time_per_iteration_ms", elapsed_time_per_iteration_ms, "human_format"),  # , ".1f"),
-                LogItem("tokens_per_sec", tokens_per_sec, "human_format"),  # , "1.6E"),
+                LogItem("train/elapsed_time_per_iteration_ms", elapsed_time_per_iteration_ms, "human_format"),  # , ".1f"),
+                LogItem("train/tokens_per_sec", tokens_per_sec, "human_format"),  # , "1.6E"),
                 LogItem(
-                    "tokens_per_sec_per_gpu", tokens_per_sec / self.parallel_context.world_pg.size(), "human_format"
+                    "train/tokens_per_sec_per_gpu", tokens_per_sec / self.parallel_context.world_pg.size(), "human_format"
                 ),  # , "1.6E"),
-                LogItem("global_batch_size", self.global_batch_size, "human_format"),  # , "5d"),
-                LogItem("lm_loss", loss_avg.item(), "human_format"),  # , "1.6E"),
-                LogItem("lr", lr, "human_format"),  # , ".3E"),
-                LogItem("model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
-                LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
+                LogItem("train/global_batch_size", self.global_batch_size, "human_format"),  # , "5d"),
+                LogItem("train/loss", loss_avg.item(), "human_format"),  # , "1.6E"),
+                LogItem("train/lr", lr, "human_format"),  # , ".3E"),
+                LogItem("train/model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
+                LogItem("train/hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             ]
 
             if self.config.optimizer.clip_grad is not None:
-                log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
+                log_entries.append(LogItem("train/grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))
 
             # Log not too often the memory
             if self.iteration_step < 5 or (self.iteration_step - 1) % self.config.checkpoints.checkpoint_interval == 0:
-                total, used, free = shutil.disk_usage("/")
-                log_entries.extend(
-                    [
-                        LogItem(
-                            "cuda_memory_allocated", torch.cuda.memory_allocated(), "human_format"
-                        ),  #  / 1024**2, ".2f"),
-                        LogItem(
-                            "cuda_max_memory_reserved", torch.cuda.max_memory_reserved(), "human_format"
-                        ),  #  / 1024**2, ".2f"),
-                        LogItem("hd_total_memory_tb", total, "human_format"),  #  / (2**40), ".2f"),
-                        LogItem("hd_used_memory_tb", used, "human_format"),  #  / (2**40), ".2f"),
-                        LogItem("hd_free_memory_tb", free, "human_format"),  #  / (2**40), ".2f"),
-                    ]
-                )
+                log_entries.extend(self.memory_logs())
 
             # NOTE: only one rank writes to wandb
             if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
@@ -675,6 +840,70 @@ class DistributedTrainer:
                 os.system("scancel " + os.environ["SLURM_JOB_ID"])
             else:
                 exit(0)
+
+    def val_step_logs(
+        self,
+        global_loss: torch.Tensor,
+        domain_losses: Dict[str, torch.Tensor],
+    ):
+        dist.barrier()
+        torch.cuda.synchronize()
+        
+        # General metrics
+        validation_total_samples = self.limit_val_batches * self.micro_batch_size
+        validation_elapsed_time_per_iteration_ms = (self.validation_step_time - self.training_step_time) * 1000
+        validation_tokens_per_sec = (
+            validation_total_samples * self.sequence_length / (validation_elapsed_time_per_iteration_ms / 1000)
+        )
+        validation_model_tflops, validation_hardware_tflops = self.unwrapped_model.get_flops_per_sec(
+            iteration_time_in_sec=validation_elapsed_time_per_iteration_ms / 1000,
+            sequence_length=self.sequence_length,
+            global_batch_size=validation_total_samples,
+        )
+
+        if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
+            assert self.loggerwriter is not None, "loggerwriter should be defined on logger ranks"
+            # Validation metrics
+            log_entries = [
+                LogItem(
+                    "validation/consumed_tokens",
+                    validation_total_samples * self.sequence_length,
+                    "human_format",
+                ),  # , "12d"),
+                LogItem(
+                    "validation/elapsed_time_per_iteration_ms",
+                    validation_elapsed_time_per_iteration_ms,
+                    "human_format",
+                ),  # , ".1f"),
+                LogItem("validation/tokens_per_sec", validation_tokens_per_sec, "human_format"),  # , "1.6E"),
+                LogItem(
+                    "validation/tokens_per_sec_per_gpu",
+                    validation_tokens_per_sec / self.parallel_context.world_pg.size(),
+                    "human_format",
+                ),  # , "1.6E"),
+                LogItem("validation/loss", global_loss.item(), "human_format"),  # , "1.6E"),
+                LogItem(
+                    "validation/model_tflops_per_gpu", validation_model_tflops / 3, "human_format"
+                ),  # , ".2f"), # NOTE(tj.solergibert) Check llama.py --> def get_flops() --> model_flops for explanation of the / 3 factor
+                LogItem(
+                    "validation/hardware_tflops_per_gpu", validation_hardware_tflops / 3, "human_format"
+                ),  # , ".2f"), # NOTE(tj.solergibert) Check llama.py --> def get_flops() --> model_flops for explanation of the / 3 factor
+                *[
+                    LogItem(f"validation/{dom}_loss", loss.item(), "human_format")
+                    for dom, loss in domain_losses.items()
+                ]
+            ]
+
+            # NOTE: only one rank writes to wandb
+            if dist.get_rank(self.parallel_context.world_pg) == self.logger_ranks[0] and wandb is not None:
+                wandb.log(
+                    {
+                        **{log_item.tag: log_item.scalar_value for log_item in log_entries},
+                        "iteration_step": self.iteration_step,
+                    }
+                )
+
+            self.loggerwriter.add_scalars_from_list(log_entries, self.iteration_step)
 
     def init_model(self) -> Union[NanotronModel, DistributedDataParallel]:
         """Initialize the model and load weights from checkpoint if needed."""

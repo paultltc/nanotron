@@ -111,15 +111,23 @@ class S3UploadArgs:
 
 @dataclass
 class NanosetDatasetsArgs:
-    dataset_folder: Union[str, List[str]]
+    training_folder: Union[str, dict, List[str]]
+    validation_folder: Union[str, List[str]]
     dataset_weights: Optional[List[float]] = None
+    domains: Optional[List[str]] = None
+    languages: Optional[List[str]] = None   # NOTE(@paultltc): For back-compatibility
 
     def __post_init__(self):
-        if isinstance(self.dataset_folder, str):  # Case 1: 1 Dataset folder
-            self.dataset_folder = [self.dataset_folder]
-            self.dataset_weights = [1]
-
-
+        if self.languages is not None and self.domains is None:
+            self.domains = self.languages
+        if isinstance(self.training_folder, str):  # Case 1: 1 Dataset folder
+            self.training_folder = [self.training_folder]
+            self.dataset_weights = [1]      
+        elif isinstance(self.training_folder, dict):  # Case 3: dict with > 1 dataset_folder and weights
+            tmp_dataset_folder = self.training_folder.copy()
+            self.training_folder = list(tmp_dataset_folder.keys())
+            self.dataset_weights = list(tmp_dataset_folder.values())
+    
 @dataclass
 class DataArgs:
     """Arguments related to the data and data files processing"""

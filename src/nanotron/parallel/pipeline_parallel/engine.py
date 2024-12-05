@@ -9,7 +9,7 @@ from nanotron.logging import log_rank
 from nanotron.optim.gradient_accumulator import GradientAccumulator
 from nanotron.parallel.data_parallel.utils import ddp_trigger_sync_in_bwd
 from nanotron.parallel.pipeline_parallel.context_manager import attach_pipeline_state_to_model
-from nanotron.parallel.pipeline_parallel.state import PipelineTrainBatchState
+from nanotron.parallel.pipeline_parallel.state import PipelineTrainBatchState, PipelineEvalBatchState
 from nanotron.parallel.pipeline_parallel.tensor_pointer import TensorPointer
 from nanotron.utils import ContextManagers
 from torch import nn as torch_nn
@@ -29,6 +29,7 @@ class PipelineEngine(ABC):
         state: PipelineTrainBatchState,
         micro_batch: Dict[str, Union[torch.Tensor, TensorPointer]],
         model: torch_nn.Module,
+        is_validation: bool = False,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         # Increment the number of backwards
         state.nb_forwards += 1
@@ -52,7 +53,7 @@ class PipelineEngine(ABC):
             output["loss"] = output["loss"] / self.nb_microbatches
 
         # Add output as activations that require backward pass
-        if not isinstance(output["loss"], TensorPointer):
+        if not isinstance(output["loss"], TensorPointer) and not is_validation:
             assert output["loss"].requires_grad
             state.register_activation_requiring_backward(output["loss"])
         return output
@@ -134,7 +135,7 @@ class PipelineEngine(ABC):
         nb_microbatches: int,
     ) -> Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]]:
         # Assign a new state for the current batch
-        state = PipelineTrainBatchState()  # TODO: do i need state?
+        state = PipelineEvalBatchState()  # TODO: do i need state?
         self.nb_microbatches = nb_microbatches
 
         outputs = []
@@ -143,7 +144,7 @@ class PipelineEngine(ABC):
             # All forward
             for micro_batch in batch:
                 context = self._get_fwd_context(model=model)
-                output = self.forward(context=context, state=state, micro_batch=micro_batch, model=model)
+                output = self.forward(context=context, state=state, micro_batch=micro_batch, model=model, is_validation=True)
                 # TODO @thomasw21: Somehow this needs to be done somewhere else to support interleaving. Somewhere right after a "stage"
                 for _ in range(len(state.microbatches_activations_to_send)):
                     send_activation = state.microbatches_activations_to_send.popleft()
@@ -157,6 +158,7 @@ class PipelineEngine(ABC):
                 # Store the loss for each microbatch
                 if not isinstance(output["loss"], TensorPointer):
                     output = {k: v.detach() for k, v in output.items()}
+                output['domain_idx'] = micro_batch['input_domain'].flatten().tolist()
                 outputs.append(output)
 
         return outputs

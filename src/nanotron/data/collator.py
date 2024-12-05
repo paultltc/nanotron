@@ -34,21 +34,24 @@ class NanosetDataCollatorForCLM:
             return {
                 "input_ids": TensorPointer(group_rank=self.input_pp_rank),
                 "input_mask": TensorPointer(group_rank=self.input_pp_rank),
+                "input_domain": TensorPointer(group_rank=self.input_pp_rank),
                 "label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "label_mask": TensorPointer(group_rank=self.output_pp_rank),
             }
 
-        # Make sure we load only what's necessary, ie we only load a `input_ids` column.
-        assert all(list(example.keys()) == ["input_ids"] for example in examples)
+        # Make sure we load only what's necessary, ie we only load a `input_ids` and `domain_idx` column.
+        assert all(list(example.keys()) == ["input_ids", "domain_idx"] for example in examples)
 
         # TODO @nouamanetazi: Is it better to have examples as np.array or torch.Tensor?
         input_ids = torch.vstack([examples[i]["input_ids"] for i in range(len(examples))])  # (b, s)
+        input_domain = torch.vstack([examples[i]["domain_idx"] for i in range(len(examples))])  # (b, 1)
         batch_size, expanded_input_length = input_ids.shape
 
         result: Dict[str, Union[torch.LongTensor, TensorPointer]] = {}
 
         result["input_ids"] = TensorPointer(group_rank=self.input_pp_rank)
         result["input_mask"] = TensorPointer(group_rank=self.input_pp_rank)
+        result["input_domain"] = TensorPointer(group_rank=self.input_pp_rank)
         result["label_ids"] = TensorPointer(group_rank=self.output_pp_rank)
         result["label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
 
@@ -60,6 +63,7 @@ class NanosetDataCollatorForCLM:
         if current_pp_rank == self.input_pp_rank:
             result["input_ids"] = input_ids[:, :-1]
             result["input_mask"] = torch.ones((batch_size, self.sequence_length), dtype=torch.bool)
+            result["input_domain"] = input_domain
 
         # Process labels: shift them to the left
         if current_pp_rank == self.output_pp_rank:

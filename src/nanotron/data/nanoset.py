@@ -98,7 +98,10 @@ class Nanoset(torch.utils.data.Dataset):
         dataset = self.dataset_index[idx]
         dataset_sample = self.dataset_sample_index[idx]
 
-        return self.datatrove_datasets[dataset][dataset_sample]
+        item_dict = self.datatrove_datasets[dataset][dataset_sample]
+        item_dict['domain_idx'] = torch.tensor(dataset, dtype=torch.long)
+
+        return item_dict
 
     def build_nanoset_index(self) -> np.ndarray:
         """
