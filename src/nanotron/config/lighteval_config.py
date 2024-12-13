@@ -60,6 +60,8 @@ class LightEvalTasksArgs:
     multichoice_continuations_start_space: Optional[bool] = None
     no_multichoice_continuations_start_space: Optional[bool] = None
 
+    langs: Optional[str] = None
+
 
 @dataclass
 class LightEvalWandbLoggerConfig:
