@@ -561,18 +561,6 @@ class DistributedTrainer:
                 outputs, loss_avg = self.training_step(dataloader=self.current_dataloader)
                 self.training_step_time = time.time()
 
-                # Validation stage
-                if self.iteration_step % self.config.tokens.val_check_interval == 0:
-                    self._prepare_dataloader_for_validation_stage(valid_dataloader_or_dls)
-                    val_global_loss, val_domain_losses = self.validation_step(
-                        dataloader=self.current_validation_dataloader
-                    )
-                    self.validation_step_time = time.time()
-                else:
-                    # NOTE(tj.solergibert) As we are reporting the training & validation metrics together, we
-                    # must comply with val_check_interval % iteration_step_info_interval = 0
-                    val_global_loss, val_domain_losses = None, None
-
                 # Training Logs
                 # TODO(xrsrke): refactor using callbacks would be better
                 self.metadata.consumed_train_samples += self.global_batch_size
@@ -581,10 +569,19 @@ class DistributedTrainer:
                     self.metadata.last_stage_idx
                 ].consumed_train_samples += self.global_batch_size
 
-                if (self.iteration_step - 1) % self.config.logging.iteration_step_info_interval == 0:
+                if self.iteration_step % self.config.logging.iteration_step_info_interval == 0:
                     self.train_step_logs(outputs=outputs, loss_avg=loss_avg)
-                    if self.iteration_step % self.config.tokens.val_check_interval == 0:
-                        self.val_step_logs(global_loss=val_global_loss, domain_losses=val_domain_losses)
+
+                # Validation stage
+                if self.iteration_step % self.config.tokens.val_check_interval == 0:
+                    self._prepare_dataloader_for_validation_stage(valid_dataloader_or_dls)
+                    val_global_loss, val_domain_losses = self.validation_step(
+                        dataloader=self.current_validation_dataloader
+                    )
+                    self.validation_step_time = time.time()
+
+                    # NOTE(@paultltc): We log the validation step each time we compute it
+                    self.val_step_logs(global_loss=val_global_loss, domain_losses=val_domain_losses)                        
 
                 # Checkpoint
                 if self.iteration_step % self.config.checkpoints.checkpoint_interval == 0:
