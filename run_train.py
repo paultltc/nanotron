@@ -199,10 +199,10 @@ def get_valid_dataloader_from_data_stage(
         with main_rank_first(trainer.parallel_context.world_pg):
             valid_dataset = Nanoset(
                 dataset_folders=data.dataset.validation_folder, 
-                dataset_weights=data.dataset.dataset_weights,   # TODO(@paultltc): Should we weight the valid dataset?
+                dataset_weights=None,   # TODO(@paultltc): Should we weight the valid dataset?
                 sequence_length=trainer.sequence_length,
                 token_size=token_size,
-                train_split_num_samples=trainer.config.tokens.train_steps * trainer.global_batch_size,
+                train_split_num_samples=trainer.config.tokens.limit_val_batches * trainer.global_batch_size,
                 random_seed=data.seed,
             )
 
